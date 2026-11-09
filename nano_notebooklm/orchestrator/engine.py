@@ -14,6 +14,7 @@ from nano_notebooklm.skills.exam_analyzer import ExamAnalyzerSkill
 from nano_notebooklm.skills.exam_prep import ExamPrepSkill
 from nano_notebooklm.skills.mastery_tracker import MasteryTrackerSkill
 from nano_notebooklm.skills.note_generator import NoteGeneratorSkill
+from nano_notebooklm.skills.past_exams_skill import PastExamsSkill
 from nano_notebooklm.skills.qa_skill import QASkill
 from nano_notebooklm.skills.quiz_generator import QuizGeneratorSkill
 from nano_notebooklm.skills.report_generator import ReportGeneratorSkill
@@ -39,6 +40,7 @@ class Orchestrator:
             "quiz_generator": QuizGeneratorSkill(kb, router),
             "exam_analyzer": ExamAnalyzerSkill(kb, router),
             "exam_prep": ExamPrepSkill(kb, router),
+            "past_exams": PastExamsSkill(kb, router),
             "mastery_tracker": MasteryTrackerSkill(kb, router),
             "report_generator": ReportGeneratorSkill(kb, router),
         }

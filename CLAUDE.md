@@ -37,6 +37,8 @@ frontend/                        React 18, no bundler. Edit a .jsx and reload.
   notes.jsx                      LaTeX notes editor (CodeMirror) + tectonic PDF.
   mindmap.jsx                    d3-force KG with edit ops.
   exam-prep.jsx                  Self-evolving quiz.
+  past-exams.jsx                 Past-exam upload, per-question topic tags, practice in
+                                 past-exam style (reuses ExamPrepQuiz / ExamPrepResult).
   quiz.jsx                       Practice quiz (one-shot, non-bank).
   library.jsx                    Course library sidebar + course picker modal.
   processing.jsx                 Upload progress overlay (consumes NDJSON stage events
@@ -83,6 +85,9 @@ nano_notebooklm/
     note_generator.py            Legacy single-shot note skill (kept for /api/notes).
     quiz_generator.py            Practice quiz.
     exam_prep.py                 Topic plan → seed questions → quiz draw → submit + variant.
+    past_exams_skill.py          Past exams kept OUT of the KB: extract → split into questions →
+                                 tag by exam-prep topic (off_topic = ignored) → exemplars for
+                                 exam_prep generation (origin=past_exam_style in the bank).
     exam_analyzer.py             One-shot exam-pattern analysis (older surface).
     report_generator.py          Long-form course report.
     mastery_tracker.py           Read-only mastery scoring.

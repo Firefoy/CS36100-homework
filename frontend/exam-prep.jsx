@@ -394,6 +394,11 @@ function ExamPrepQuiz({ t, questions, scope, answers, onAnswer, onSubmit, onCanc
             <span className="mono dim">{q.type}</span>
             {q.difficulty && <span className="mono dim">{q.difficulty}</span>}
           </div>
+          {Array.isArray(q.exemplar_refs) && q.exemplar_refs.length > 0 && (
+            <div className="exam-q-inspired">
+              {t("exam.quiz.inspired_by", { refs: q.exemplar_refs.slice(0, 3).join(", ") })}
+            </div>
+          )}
           <p className="exam-q-prompt">{q.prompt}</p>
           {q.options && Array.isArray(q.options) ? (
             <div className="exam-q-options">
@@ -522,4 +527,5 @@ function ExamPrepResult({ t, graded, questions, answers, onContinue, onAgain }) 
   );
 }
 
-Object.assign(window, { ExamPrep });
+// ExamPrepQuiz / ExamPrepResult are reused by the Past Exams tab.
+Object.assign(window, { ExamPrep, ExamPrepQuiz, ExamPrepResult });

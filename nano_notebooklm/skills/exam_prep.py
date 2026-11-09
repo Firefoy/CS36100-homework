@@ -25,6 +25,13 @@ total ≥ TOPIC_MASTERY_MIN_QUESTIONS (3).
 Variant budget per submit: `min(PER_TOPIC_CAP=5, max(1, TOTAL_CAP=20 //
 wrong_topic_count))` so a single-topic miss can't burn 20 LLM calls and
 many-topic misses still get at least one variant each.
+
+Question provenance (bank v2): every question carries `origin`:
+  "generated"        — written from course material alone.
+  "past_exam_style"  — written from course material + past-exam exemplars
+                       (see skills/past_exams_skill.py); also carries
+                       `exemplar_ids` / `exemplar_refs`. Variants of such
+                       a question reuse its exemplars so they keep the style.
 """
 
 from __future__ import annotations
@@ -47,7 +54,13 @@ from nano_notebooklm.types import SkillResult
 
 logger = logging.getLogger(__name__)
 
-EXAM_BANK_VERSION = 1
+EXAM_BANK_VERSION = 2
+ORIGIN_GENERATED = "generated"
+ORIGIN_PAST_EXAM_STYLE = "past_exam_style"
+QUESTION_ORIGINS = (ORIGIN_GENERATED, ORIGIN_PAST_EXAM_STYLE)
+# Generated questions whose token overlap with a past-exam exemplar reaches
+# this are treated as copies, not imitations, and dropped.
+NEAR_COPY_JACCARD = 0.8
 MASTERED_THRESHOLD = 3
 TOPIC_MASTERY_RATIO = 0.8
 TOPIC_MASTERY_MIN_QUESTIONS = 3
@@ -223,11 +236,13 @@ def load_bank(course_id: str) -> dict:
 
 
 def _migrate_bank(data: dict, from_version: int) -> dict:
-    """Forward-migration shell. version=1 is the only schema today; future
-    bumps add branches here. Keeps `load_bank` non-destructive: it produces a
-    valid current-version bank without overwriting the on-disk file (the next
-    save_bank call will eventually persist the migrated shape)."""
-    # No migrations to apply yet — placeholder so future versions have a hook.
+    """Forward-migrate an older bank in memory. Keeps `load_bank`
+    non-destructive: it produces a valid current-version bank without
+    overwriting the on-disk file (the next save_bank call persists it)."""
+    if from_version < 2:
+        for t in data.get("topics", []) or []:
+            for q in t.get("questions", []) or []:
+                q.setdefault("origin", ORIGIN_GENERATED)
     data["version"] = EXAM_BANK_VERSION
     return data
 
@@ -304,6 +319,17 @@ def _norm_signature(text: str) -> str:
     near-duplicates collapse."""
     norm = " ".join(str(text or "").lower().split())
     return _TRAILING_PUNCT_RE.sub("", norm)
+
+
+_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+
+
+def token_jaccard(a: str, b: str) -> float:
+    ta = set(_TOKEN_RE.findall(str(a or "").lower()))
+    tb = set(_TOKEN_RE.findall(str(b or "").lower()))
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
 
 
 def _extract_letter(text: str) -> str:
@@ -689,8 +715,15 @@ class ExamPrepSkill(Skill):
         kinds: tuple[str, ...],
         variant_of: str | None,
         user_lang: str | None = None,
+        exemplars: list[dict] | None = None,
     ) -> int:
-        """Append `count` questions per kind to topic. Returns total added."""
+        """Append questions to `topic`. Returns total added.
+
+        Without `exemplars`: `count` questions per kind, from course material.
+        With `exemplars` (past-exam questions, see past_exams_skill): `count`
+        questions in total, styled on the exemplars, with `kinds` as the
+        allowed types; tagged origin=past_exam_style.
+        """
         if count <= 0 or not kinds:
             return 0
 
@@ -721,14 +754,29 @@ class ExamPrepSkill(Skill):
                 + "\n".join(f"- {(q.get('prompt') or '')[:100]}" for q in recent)
             )
 
-        num_total = count * len(kinds)
-        prompt = prompts.EXAM_PREP_QUESTIONS_PROMPT.format(
-            num_questions=num_total,
-            topic_name=topic["name"],
-            question_types=", ".join(kinds),
-            source_text=source_text,
-            avoid_block=avoid_block,
-        )
+        if exemplars:
+            exemplar_block = "\n\n".join(
+                f"[{e.get('ref') or 'past exam'}]\n{(e.get('text') or '')[:1200]}"
+                + (f"\nFocus on: {e['focus']}" if e.get("focus") else "")
+                + (f"\nOfficial answer: {(e.get('solution') or '')[:600]}" if e.get("solution") else "")
+                for e in exemplars
+            )
+            prompt = prompts.PAST_EXAM_MIMIC_PROMPT.format(
+                num_questions=count,
+                topic_name=topic["name"],
+                exemplar_block=exemplar_block,
+                question_types=", ".join(kinds),
+                source_text=source_text,
+                avoid_block=avoid_block,
+            )
+        else:
+            prompt = prompts.EXAM_PREP_QUESTIONS_PROMPT.format(
+                num_questions=count * len(kinds),
+                topic_name=topic["name"],
+                question_types=", ".join(kinds),
+                source_text=source_text,
+                avoid_block=avoid_block,
+            )
         prompt += prompts.USER_LANG_REMINDER(user_lang)
         system = prompts.EXAM_PREP_SYSTEM
         binding = prompts.USER_LANG_BINDING(user_lang)
@@ -767,6 +815,14 @@ class ExamPrepSkill(Skill):
             return 0
 
         existing_sigs = {_norm_signature(q.get("prompt") or "") for q in topic.get("questions", [])}
+        exemplar_texts = [str(e.get("text") or "") for e in (exemplars or [])]
+        provenance: dict[str, Any] = {"origin": ORIGIN_GENERATED}
+        if exemplars:
+            provenance = {
+                "origin": ORIGIN_PAST_EXAM_STYLE,
+                "exemplar_ids": [e["id"] for e in exemplars if e.get("id")],
+                "exemplar_refs": [e["ref"] for e in exemplars if e.get("ref")],
+            }
         added = 0
         for rq in raw_qs:
             if not isinstance(rq, dict):
@@ -776,6 +832,8 @@ class ExamPrepSkill(Skill):
                 continue
             sig = _norm_signature(prompt_text)
             if sig in existing_sigs:
+                continue
+            if any(token_jaccard(prompt_text, ex) >= NEAR_COPY_JACCARD for ex in exemplar_texts):
                 continue
             qtype = str(rq.get("type") or "short_answer")
             if qtype not in {"multiple_choice", "short_answer", "calculation"}:
@@ -798,6 +856,7 @@ class ExamPrepSkill(Skill):
                 "consecutive_correct": 0,
                 "mastered": False,
                 "archived": False,
+                **provenance,
             })
             existing_sigs.add(sig)
             added += 1
@@ -825,6 +884,12 @@ class ExamPrepSkill(Skill):
         # already-mastered questions (they may want to review). Without an
         # explicit topic_ids, exclude mastered to focus on weak areas.
         include_mastered = bool(requested_topic_ids)
+        origin = params.get("origin")
+        if origin not in QUESTION_ORIGINS:
+            origin = None
+
+        def _origin_ok(q: dict) -> bool:
+            return origin is None or (q.get("origin") or ORIGIN_GENERATED) == origin
 
         candidates = []
         for t in bank["topics"]:
@@ -837,12 +902,18 @@ class ExamPrepSkill(Skill):
             _, _, _, mastered = topic_mastery(t)
             if mastered and not requested_topic_ids:
                 continue
+            # Past-exam-style questions only come from explicit generation,
+            # so a topic without any can't be auto-seeded into this quiz.
+            if origin == ORIGIN_PAST_EXAM_STYLE and not any(
+                _origin_ok(q) and not q.get("archived") for q in t.get("questions", [])
+            ):
+                continue
             candidates.append(t)
 
         if not candidates:
             return SkillResult(success=True, data={
                 "questions": [], "total_available": 0, "topic_count": 0,
-                "reason": "all_mastered",
+                "reason": "no_past_exam_questions" if origin == ORIGIN_PAST_EXAM_STYLE else "all_mastered",
                 "view": self._compute_view(bank),
             })
 
@@ -868,7 +939,7 @@ class ExamPrepSkill(Skill):
         scored: list[tuple[float, dict, dict]] = []
         for t in candidates:
             for q in t.get("questions", []):
-                if q.get("archived"):
+                if q.get("archived") or not _origin_ok(q):
                     continue
                 if not include_mastered and question_mastered(q):
                     continue
@@ -897,7 +968,10 @@ class ExamPrepSkill(Skill):
         if not picked:
             if seeding_attempted and not seeding_succeeded:
                 reason = "generation_failed"
-            elif all(question_mastered(q) for t in candidates for q in t.get("questions", []) if not q.get("archived")):
+            elif all(
+                question_mastered(q) for t in candidates for q in t.get("questions", [])
+                if not q.get("archived") and _origin_ok(q)
+            ):
                 reason = "all_mastered"
             else:
                 reason = "no_questions"
@@ -1055,10 +1129,17 @@ class ExamPrepSkill(Skill):
                          if q.get("history") and not q["history"][-1].get("correct")),
                         None,
                     )
+                    exemplars = None
+                    if source_q and source_q.get("origin") == ORIGIN_PAST_EXAM_STYLE:
+                        from nano_notebooklm.skills.past_exams_skill import load_exemplars_by_ids
+                        exemplars = load_exemplars_by_ids(
+                            course_id, source_q.get("exemplar_ids") or [],
+                        ) or None
                     tasks.append(self._generate_questions(
                         course_id, topic, count=budget, kinds=kinds,
                         variant_of=(source_q or {}).get("id"),
                         user_lang=user_lang,
+                        exemplars=exemplars,
                     ))
                     target_ids.append(tid)
                 if not tasks:
@@ -1127,7 +1208,8 @@ class ExamPrepSkill(Skill):
                     "mastered_count": 0, "question_count": 0, "mastery_ratio": 0.0,
                     "is_mastered": False, "attempt_count": 0,
                     "correct_count": 0, "correct_rate": 0.0,
-                    "unique_attempted": 0, "is_archived": True,
+                    "unique_attempted": 0, "past_exam_style_count": 0,
+                    "is_archived": True,
                 })
                 continue
             m, total, ratio, is_mastered = topic_mastery(t)
@@ -1143,6 +1225,10 @@ class ExamPrepSkill(Skill):
                 attempts += len(hist)
                 corrects += sum(1 for h in hist if h.get("correct"))
             correct_rate = (corrects / attempts) if attempts else 0.0
+            past_exam_style_count = sum(
+                1 for q in t.get("questions", [])
+                if not q.get("archived") and q.get("origin") == ORIGIN_PAST_EXAM_STYLE
+            )
             topics_view.append({
                 "id": t["id"],
                 "name": t["name"],
@@ -1155,6 +1241,7 @@ class ExamPrepSkill(Skill):
                 "correct_count": corrects,
                 "correct_rate": correct_rate,
                 "unique_attempted": unique_attempted,
+                "past_exam_style_count": past_exam_style_count,
                 "is_archived": False,
             })
             total_mastered += m

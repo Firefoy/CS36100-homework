@@ -206,9 +206,12 @@ const API = {
     if (userLang) body.user_lang = userLang;
     return _post("/exam-prep/seed", body);
   },
-  async examPrepNextQuiz(courseId, { size = 8, topicIds = null, userLang = null } = {}) {
+  // `origin` ∈ {null, "generated", "past_exam_style"} restricts sampling by
+  // question provenance (the Past Exams tab passes "past_exam_style").
+  async examPrepNextQuiz(courseId, { size = 8, topicIds = null, userLang = null, origin = null } = {}) {
     const body = { course_id: courseId, size, topic_ids: topicIds };
     if (userLang) body.user_lang = userLang;
+    if (origin) body.origin = origin;
     return _post("/exam-prep/quiz/next", body);
   },
   async examPrepSubmit(courseId, answers, { userLang = null } = {}) {
@@ -228,6 +231,42 @@ const API = {
     const res = await fetch(`${API_BASE}/exam-prep/state/${encodeURIComponent(courseId)}`, { method: "DELETE" });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return res.json();
+  },
+
+  // ── Past Exams (style exemplars for Exam Prep) ──────────────────
+  // Upload returns immediately; poll pastExamsView while `processing`.
+  async pastExamsView(courseId) {
+    return _request(`/past-exams/${encodeURIComponent(courseId)}`);
+  },
+  async pastExamsUpload(courseId, files, { engine = "pymupdf", lang = "en", userLang = null } = {}) {
+    const formData = new FormData();
+    for (const f of files) formData.append("files", f);
+    const qs = new URLSearchParams({ engine, lang });
+    if (userLang) qs.set("user_lang", userLang);
+    return _request(`/past-exams/${encodeURIComponent(courseId)}/upload?${qs}`, {
+      method: "POST",
+      body: formData,
+    });
+  },
+  async pastExamsSetTags(courseId, questionId, { topicIds = [], match = "primary" } = {}) {
+    return _request(`/past-exams/${encodeURIComponent(courseId)}/questions/${encodeURIComponent(questionId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ topic_ids: topicIds, match }),
+    });
+  },
+  async pastExamsRetag(courseId, { userLang = null } = {}) {
+    const body = {};
+    if (userLang) body.user_lang = userLang;
+    return _post(`/past-exams/${encodeURIComponent(courseId)}/retag`, body);
+  },
+  async pastExamsGenerate(courseId, topicIds, { count = 3, userLang = null } = {}) {
+    const body = { topic_ids: topicIds, count };
+    if (userLang) body.user_lang = userLang;
+    return _post(`/past-exams/${encodeURIComponent(courseId)}/generate`, body);
+  },
+  async pastExamsDelete(courseId, examId) {
+    return _request(`/past-exams/${encodeURIComponent(courseId)}/${encodeURIComponent(examId)}`, { method: "DELETE" });
   },
 
   async ingestCourse(courseDir, courseId = null) {

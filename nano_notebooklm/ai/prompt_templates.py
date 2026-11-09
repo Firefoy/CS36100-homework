@@ -638,6 +638,105 @@ Rules:
 - Each question must probe a DIFFERENT angle of the topic (definition, application, comparison, edge case, derivation, etc.).
 - If the system prompt contains a user-language binding, follow it strictly for prompt + options + explanation; otherwise default to the source-material language."""
 
+# ── Past Exams (style exemplars for Exam Prep) ───────────────────────
+PAST_EXAM_SYSTEM = (
+    "You are an assistant that digitises past exam papers for a study tool. "
+    "Output strictly valid JSON. Never invent questions that are not in the text."
+)
+
+PAST_EXAM_SEGMENT_PROMPT = """Split this past exam (or part of one) into individual questions.
+
+Exam file: {filename}
+The text was extracted from the document; `[page N]` markers show page boundaries. Layout may be imperfect.
+
+{exam_text}
+
+Output a JSON object:
+{{
+  "questions": [
+    {{
+      "number": "question label as printed, e.g. \\"3\\" or \\"3b\\"",
+      "text": "the full question text, self-contained",
+      "points": 10,
+      "kind": "multiple_choice|short_answer|calculation|trace|proof|code|other",
+      "solution": "the official answer if this document includes one, else null",
+      "page": 2
+    }}
+  ]
+}}
+
+Rules:
+- One entry per gradable question. Split a multi-part question into one entry per sub-part, and repeat the shared stem/setup in each sub-part's `text` so it stands alone.
+- Keep multiple-choice options inside `text`.
+- Skip cover pages, instructions, honor codes, blank answer space and page furniture.
+- If a question relies on a figure that is not in the text, keep the question and append "[figure omitted]".
+- `points` and `page` are null when unknown. Never fabricate a `solution`.
+- If the text contains no questions, return {{"questions": []}}."""
+
+PAST_EXAM_TAG_PROMPT = """Decide which course topic each past-exam question is testing.
+
+Course topics (the ONLY valid topic ids):
+{topics_block}
+
+Past-exam questions:
+{questions_block}
+
+Output a JSON object:
+{{
+  "tags": [
+    {{
+      "question_id": "id from the list above",
+      "topic_ids": ["topic id this question PRIMARILY tests"],
+      "match": "primary|partial|off_topic",
+      "confidence": 0.0,
+      "focus": "for `partial` only: the part of the question that is about the topic, else null"
+    }}
+  ]
+}}
+
+Rules:
+- `primary`: the question is mainly about the listed topic(s).
+- `partial`: only part of the question is about a listed topic (e.g. one step of a larger problem); put that part in `focus`.
+- `off_topic`: none of the course topics cover what the question tests. Use an empty `topic_ids`. This is expected and common: exams often cover material that is not in these course files. Do NOT force a match on loose keyword overlap.
+- Use at most 2 topic ids per question, and only ids from the list.
+- `confidence` is your probability (0-1) that the tag is right.
+- Return exactly one entry per question."""
+
+PAST_EXAM_MIMIC_PROMPT = """Write {num_questions} NEW exam questions on one topic, modelled on how this course's past exams test it.
+
+Topic: {topic_name}
+
+Past-exam questions on this topic (style reference ONLY, never copy them):
+{exemplar_block}
+
+Course material (the ONLY source of facts you may test):
+{source_text}
+{avoid_block}
+
+Output a JSON object:
+{{
+  "questions": [
+    {{
+      "prompt": "the question text",
+      "type": "multiple_choice|short_answer|calculation",
+      "options": ["A. ...", "B. ...", "C. ...", "D. ..."],
+      "answer": "letter like 'B' for multi-choice, OR the canonical final result",
+      "explanation": "1-3 sentence worked solution",
+      "difficulty": "easy|medium|hard",
+      "concepts": ["sub-concept tag 1", "..."]
+    }}
+  ]
+}}
+
+Rules:
+- Mirror the past questions' structure, task verbs, difficulty and level of detail. If they ask to trace an algorithm on a concrete input, do the same on a NEW input.
+- Never reuse a past question's wording, numbers or input data. Each question must be a fresh instance of the same kind of task.
+- Test only what the course material supports. If a past question also touches concepts outside this topic, ignore those parts.
+- Allowed types: {question_types}. Turn proof / code / trace style tasks into `short_answer` or `calculation` with one concrete, checkable final answer (the resulting array, a count, a complexity class, ...).
+- For `multiple_choice`: exactly 4 options as "X. text", and `answer` MUST be a single uppercase letter A/B/C/D.
+- For `short_answer`/`calculation`: omit `options`; `answer` is ONLY the final result (≤30 words), the reasoning goes in `explanation`.
+- If the system prompt contains a user-language binding, follow it strictly for prompt + options + explanation; otherwise default to the source-material language."""
+
 # ── R3-3: Mind-map node deep-dive ────────────────────────────────────
 # Used by `/api/mindmap/{cid}/explain-node`. The agent loop runs with a
 # strict tool subset (search_kb + read_chunk only) for at most 4 turns,

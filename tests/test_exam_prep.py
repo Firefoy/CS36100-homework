@@ -145,7 +145,7 @@ def test_check_answer_short_answer_substring_match():
 
 def test_load_bank_returns_empty_for_missing_file(isolated_artifacts):
     bank = load_bank("ghost-course")
-    assert bank["version"] == 1
+    assert bank["version"] == _exam_prep_mod.EXAM_BANK_VERSION
     assert bank["topics"] == []
     assert bank["course_id"] == "ghost-course"
 
@@ -192,7 +192,7 @@ def test_load_bank_missing_version_returns_empty(isolated_artifacts):
     path.write_text(json.dumps({"topics": [{"id": "old"}]}))
     bank = load_bank("c1")
     assert bank["topics"] == []
-    assert bank["version"] == 1
+    assert bank["version"] == _exam_prep_mod.EXAM_BANK_VERSION
 
 
 # ── Mastery semantics ────────────────────────────────────────────────

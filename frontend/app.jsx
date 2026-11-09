@@ -1,4 +1,4 @@
-/* global React, Library, Reader, Notes, MindMap, Quiz, ExamPrep, Settings, Assistant, Processing, API, StudyState,
+/* global React, Library, Reader, Notes, MindMap, Quiz, ExamPrep, PastExams, Settings, Assistant, Processing, API, StudyState,
    SAMPLE_SOURCES, TweaksPanel, useTweaks, TweakSection,
    TweakRadio, TweakSlider, TweakToggle, NOTES_DATA, QUIZ_DATA, MINDMAP */
 const { useState, useEffect, useRef } = React;
@@ -1796,6 +1796,7 @@ function App() {
     { id: "notes", label: t("tab.notes"), num: realNotes ? "✓" : "—" },
     { id: "mindmap", label: t("tab.mindmap"), num: realMindmap ? "✓" : "—" },
     { id: "exam-prep", label: t("tab.exam_prep"), num: "★" },
+    { id: "past-exams", label: t("tab.past_exams"), num: "◆" },
     // 2026-05-13: Skills tab hidden — its three cards (Exam Analysis /
     // Course Report / Mastery Dashboard) overlap conceptually with Exam
     // Prep, which has a clearer closed-loop UX. The view + handlers
@@ -2172,6 +2173,9 @@ function App() {
           )}
           {effectiveMode === "exam-prep" && (
             <ExamPrep activeCourse={activeCourse} userLang={userLang} />
+          )}
+          {effectiveMode === "past-exams" && (
+            <PastExams activeCourse={activeCourse} userLang={userLang} />
           )}
           {effectiveMode === "skills" && (
             <SkillsDashboard

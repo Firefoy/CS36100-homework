@@ -907,6 +907,7 @@ class ExamPrepNextQuizRequest(BaseModel):
     size: int = Field(8, ge=1, le=20, description="How many questions to sample for this quiz round (1-20).")
     topic_ids: list[str] | None = Field(None, description="Restrict sampling to these topic ids; None = all non-mastered topics. Setting this also re-includes mastered questions within those topics for review.", max_length=32)
     user_lang: Literal["zh", "en"] | None = Field(None, description="Reply language for any newly-seeded questions.")
+    origin: Literal["generated", "past_exam_style"] | None = Field(None, description="Only sample questions with this provenance; `past_exam_style` = written from uploaded past-exam exemplars. None = any.")
 
     @field_validator("topic_ids")
     @classmethod
@@ -1624,6 +1625,7 @@ async def exam_prep_next_quiz(req: ExamPrepNextQuizRequest):
         "size": req.size,
         "topic_ids": req.topic_ids,
         "user_lang": req.user_lang,
+        "origin": req.origin,
     })
     if not result.success:
         _raise_exam_prep_error(result, "exam_prep_quiz_failed")
@@ -1688,6 +1690,195 @@ async def exam_prep_reset(course_id: str):
     })
     if not result.success:
         _raise_exam_prep_error(result, "exam_prep_reset_failed")
+    return result.data
+
+
+# ── Past Exams — style exemplars for Exam Prep ────────────────────────
+# Uploaded exams live under artifacts/courses/<id>/past_exams/, never in the
+# course KB (see past_exams_skill). Processing runs as a background task;
+# the client polls GET /api/past-exams/{course_id} while `processing` is
+# true. Practice reuses /api/exam-prep/quiz/* with origin=past_exam_style.
+
+PAST_EXAM_MAX_FILES = 10
+_PAST_EXAM_ID_RE = re.compile(r"^[a-f0-9]{12}$")
+_PAST_EXAM_QID_RE = re.compile(r"^pq_[a-f0-9]{12}$")
+
+
+def _past_exam_status_for_error(error: str | None) -> int:
+    if error in ("exam_not_found", "question_not_found"):
+        return 404
+    if error in ("exam_processing", "bank_version_too_new"):
+        return 409
+    if error in ("invalid_topic", "invalid_match", "no_exemplars", "no_course_topics"):
+        return 400
+    return 502
+
+
+def _raise_past_exam_error(result, default: str) -> None:
+    raise HTTPException(
+        status_code=_past_exam_status_for_error(result.error),
+        detail=result.error or default,
+    )
+
+
+def _bounded_topic_ids(v: list[str]) -> list[str]:
+    for tid in v:
+        if not isinstance(tid, str) or not tid or len(tid) > 64:
+            raise ValueError("topic_id must be non-empty string ≤ 64 chars")
+    return v
+
+
+class PastExamUploadResponse(BaseModel):
+    model_config = {"extra": "forbid"}
+    course_id: str
+    exam_ids: list[str]
+
+
+class PastExamTagUpdateRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    topic_ids: list[str] = Field(default_factory=list, max_length=2, description="Exam Prep topic ids this question tests; empty when match=off_topic.")
+    match: Literal["primary", "partial", "off_topic"] = Field("primary", description="`off_topic` excludes the question from every topic's exemplars.")
+
+    @field_validator("topic_ids")
+    @classmethod
+    def _bound(cls, v):
+        return _bounded_topic_ids(v)
+
+
+class PastExamRetagRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    user_lang: Literal["zh", "en"] | None = Field(None, description="Language for topics, if the course has none yet and they must be planned first.")
+
+
+class PastExamGenerateRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    topic_ids: list[str] = Field(..., min_length=1, max_length=32, description="Exam Prep topic ids to generate past-exam-style questions for.")
+    count: int = Field(3, ge=1, le=10, description="Questions to generate per topic.")
+    user_lang: Literal["zh", "en"] | None = Field(None, description="Reply language for generated questions.")
+
+    @field_validator("topic_ids")
+    @classmethod
+    def _bound(cls, v):
+        return _bounded_topic_ids(v)
+
+
+def _past_exams_skill():
+    return orchestrator.skills["past_exams"]
+
+
+@app.get("/api/past-exams/{course_id}", tags=["past-exams"], summary="List past exams, their questions and topic tags")
+async def past_exams_view(course_id: str):
+    course_id = _validate_course_id_path(course_id)
+    result = await orchestrator.run_skill("past_exams", {"action": "view", "course_id": course_id})
+    if not result.success:
+        _raise_past_exam_error(result, "past_exams_view_failed")
+    return result.data
+
+
+@app.post("/api/past-exams/{course_id}/upload", tags=["past-exams"],
+          summary="Upload past exams (background split + topic tagging)",
+          response_model=PastExamUploadResponse)
+async def past_exams_upload(
+    course_id: str,
+    files: Annotated[list[UploadFile], File(...)],
+    engine: str = Query("pymupdf", pattern="^(pymupdf|mineru)$", description="PDF extraction engine; `mineru` OCRs scanned exams."),
+    lang: str = Query("en", pattern="^(ch|en)$", description="Language hint for mineru OCR."),
+    user_lang: str | None = Query(None, pattern="^(zh|en)$", description="Language for topics, if the course has none yet."),
+):
+    from nano_notebooklm.skills import past_exams_skill as pes
+
+    course_id = _validate_course_id_path(course_id)
+    files = [f for f in files if f.filename]
+    if not files:
+        raise HTTPException(400, "No files provided")
+    if len(files) > PAST_EXAM_MAX_FILES:
+        raise HTTPException(400, f"Too many files (max {PAST_EXAM_MAX_FILES} per upload)")
+    for f in files:
+        suffix = Path(f.filename).suffix.lower()
+        if suffix not in ALLOWED_UPLOAD_SUFFIXES:
+            raise HTTPException(
+                400,
+                f"Unsupported file type '{suffix}'. Allowed: {sorted(ALLOWED_UPLOAD_SUFFIXES)}",
+            )
+
+    skill = _past_exams_skill()
+    saved: list[tuple[str, str]] = []
+    for f in files:
+        suffix = Path(f.filename).suffix.lower()
+        safe_name = _safe_upload_name(f.filename)
+        exam_id = pes.new_exam_id()
+        dest_dir = pes.exam_dir(course_id, exam_id)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            written = await _save_uploaded_file(f, dest_dir / safe_name, suffix)
+            if suffix in (".pptx", ".docx"):
+                _check_zip_safety(dest_dir / safe_name, written)
+        except Exception:
+            shutil.rmtree(dest_dir, ignore_errors=True)
+            raise
+        saved.append((exam_id, safe_name))
+
+    for exam_id, safe_name in saved:
+        await skill.register(course_id, exam_id, safe_name, engine)
+        skill.start_processing(course_id, exam_id, engine, lang, user_lang)
+    session_log.append(course_id, "generation", {"kind": "past-exam-upload", "count": len(saved)})
+    return {"course_id": course_id, "exam_ids": [e for e, _ in saved]}
+
+
+@app.patch("/api/past-exams/{course_id}/questions/{question_id}", tags=["past-exams"],
+           summary="Correct a past-exam question's topic tag")
+async def past_exams_set_tags(course_id: str, question_id: str, req: PastExamTagUpdateRequest):
+    course_id = _validate_course_id_path(course_id)
+    if not _PAST_EXAM_QID_RE.fullmatch(question_id):
+        raise HTTPException(400, "Bad question_id")
+    result = await orchestrator.run_skill("past_exams", {
+        "action": "set_tags", "course_id": course_id, "question_id": question_id,
+        "topic_ids": req.topic_ids, "match": req.match,
+    })
+    if not result.success:
+        _raise_past_exam_error(result, "past_exams_set_tags_failed")
+    return result.data
+
+
+@app.post("/api/past-exams/{course_id}/retag", tags=["past-exams"],
+          summary="Re-run topic tagging against the current Exam Prep topics")
+async def past_exams_retag(course_id: str, req: PastExamRetagRequest):
+    course_id = _validate_course_id_path(course_id)
+    result = await orchestrator.run_skill("past_exams", {
+        "action": "retag", "course_id": course_id, "user_lang": req.user_lang,
+    })
+    if not result.success:
+        _raise_past_exam_error(result, "past_exams_retag_failed")
+    return result.data
+
+
+@app.post("/api/past-exams/{course_id}/generate", tags=["past-exams"],
+          summary="Generate Exam Prep questions styled on past-exam questions for topics")
+async def past_exams_generate(course_id: str, req: PastExamGenerateRequest):
+    course_id = _validate_course_id_path(course_id)
+    result = await orchestrator.run_skill("past_exams", {
+        "action": "generate", "course_id": course_id, "topic_ids": req.topic_ids,
+        "count": req.count, "user_lang": req.user_lang,
+    })
+    if not result.success:
+        _raise_past_exam_error(result, "past_exams_generate_failed")
+    session_log.append(course_id, "generation", {
+        "kind": "past-exam-generate",
+        "added": sum((result.data.get("added") or {}).values()),
+    })
+    return result.data
+
+
+@app.delete("/api/past-exams/{course_id}/{exam_id}", tags=["past-exams"], summary="Delete one past exam")
+async def past_exams_delete(course_id: str, exam_id: str):
+    course_id = _validate_course_id_path(course_id)
+    if not _PAST_EXAM_ID_RE.fullmatch(exam_id):
+        raise HTTPException(400, "Bad exam_id")
+    result = await orchestrator.run_skill("past_exams", {
+        "action": "delete", "course_id": course_id, "exam_id": exam_id,
+    })
+    if not result.success:
+        _raise_past_exam_error(result, "past_exams_delete_failed")
     return result.data
 
 
