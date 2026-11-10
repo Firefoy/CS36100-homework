@@ -36,7 +36,7 @@ class _FakeRouter:
         self.calls: list[dict] = []
 
     async def complete_structured(self, prompt, *, system="", task_type="", **kwargs):
-        self.calls.append({"prompt": prompt, "system": system, "task_type": task_type})
+        self.calls.append({"prompt": prompt, "system": system, "task_type": task_type, **kwargs})
         queue = self.responses.get(task_type)
         if not queue:
             raise RuntimeError(f"no canned response for {task_type}")
@@ -216,6 +216,88 @@ def test_windows_split_on_page_boundaries():
     assert "[page 2]" in windows[1] and "[page 3]" in windows[1]
 
 
+class _QuotaError(Exception):
+    """Shape of an SDK 429 (openai.RateLimitError / anthropic.RateLimitError)."""
+    status_code = 429
+
+
+def _raise(exc):
+    def _r(prompt):
+        raise exc
+    return _r
+
+
+async def test_segment_quota_error_is_reported_not_no_questions(isolated_artifacts):
+    _seed_bank()
+    router = _FakeRouter({"past_exam_segment": [_raise(_QuotaError("quota"))]})
+    skill = PastExamsSkill(_FakeKB([_heap_chunk()]), router)
+    await _upload(skill)
+    exam = skill.view("ds")["exams"][0]
+    assert exam["status"] == "failed"
+    assert exam["error"] == "llm_rate_limited"
+
+
+async def test_segment_generic_failure_is_llm_failed(isolated_artifacts):
+    _seed_bank()
+    router = _FakeRouter({"past_exam_segment": [_raise(ValueError("truncated json"))]})
+    skill = PastExamsSkill(_FakeKB([_heap_chunk()]), router)
+    await _upload(skill)
+    assert skill.view("ds")["exams"][0]["error"] == "llm_failed"
+
+
+async def test_segment_requests_large_output_budget(isolated_artifacts):
+    _seed_bank()
+    router = _FakeRouter({"past_exam_segment": [_segment_response()], "past_exam_tag": [_tag_by_keyword]})
+    await _upload(PastExamsSkill(_FakeKB([_heap_chunk()]), router))
+    seg = next(c for c in router.calls if c["task_type"] == "past_exam_segment")
+    assert seg["max_tokens"] >= 16384
+
+
+async def test_tag_quota_error_keeps_questions_and_offers_retag(isolated_artifacts):
+    _seed_bank()
+    router = _FakeRouter({"past_exam_segment": [_segment_response()], "past_exam_tag": [_raise(_QuotaError("quota"))]})
+    skill = PastExamsSkill(_FakeKB([_heap_chunk()]), router)
+    await _upload(skill)
+    view = skill.view("ds")
+    exam = view["exams"][0]
+    assert exam["status"] == "ready" and exam["question_count"] == 2
+    assert exam["error"] == "tagging_llm_rate_limited"
+    assert view["needs_retag"] is True
+    assert {q["match"] for q in exam["questions"]} == {"untagged"}
+
+    router.responses["past_exam_tag"] = [_tag_by_keyword]
+    res = await skill.retag("ds", None)
+    assert res.success
+    assert res.data["exams"][0]["error"] is None
+    assert _questions_by_text(res.data)[HEAPIFY_Q]["match"] == "primary"
+
+
+async def test_failed_retag_keeps_existing_tags(isolated_artifacts):
+    _seed_bank()
+    router = _FakeRouter({"past_exam_segment": [_segment_response()], "past_exam_tag": [_tag_by_keyword]})
+    skill = PastExamsSkill(_FakeKB([_heap_chunk()]), router)
+    await _upload(skill)
+
+    router.responses["past_exam_tag"] = [_raise(_QuotaError("quota"))]
+    res = await skill.retag("ds", None)
+    assert res.error == "llm_rate_limited"
+    view = skill.view("ds")
+    assert _questions_by_text(view)[HEAPIFY_Q]["match"] == "primary"
+    assert view["exams"][0]["error"] == "tagging_llm_rate_limited"
+
+
+async def test_topic_planning_failure_is_not_reported_as_no_content(isolated_artifacts):
+    router = _FakeRouter({
+        "exam_prep_plan": [_raise(_QuotaError("quota"))],
+        "past_exam_segment": [_segment_response()],
+    })
+    skill = PastExamsSkill(_FakeKB([_heap_chunk()]), router)
+    await _upload(skill)
+    view = skill.view("ds")
+    assert view["exams"][0]["error"] == "topic_planning_failed"
+    assert view["needs_retag"] is True
+
+
 # ── overrides + retag ─────────────────────────────────────────────────
 
 
@@ -349,6 +431,62 @@ async def test_generate_without_exemplars_fails(isolated_artifacts):
     skill = PastExamsSkill(_FakeKB([_heap_chunk()]), _FakeRouter({}))
     res = await skill.generate("ds", [HEAP_TOPIC], 3, None)
     assert res.error == "no_exemplars"
+
+
+async def _uploaded_skill(gen_responses: list) -> tuple[PastExamsSkill, _FakeRouter]:
+    _seed_bank()
+    router = _FakeRouter({
+        "past_exam_segment": [_segment_response()],
+        "past_exam_tag": [_tag_by_keyword],
+        "exam_prep_questions": gen_responses,
+    })
+    skill = PastExamsSkill(_FakeKB([_heap_chunk()]), router)
+    await _upload(skill)
+    return skill, router
+
+
+async def test_generate_retries_once_on_unparseable_output(isolated_artifacts):
+    bad = _raise(json.JSONDecodeError("Expecting value", "", 0))
+    skill, router = await _uploaded_skill([bad, _mimic_response()])
+    res = await skill.generate("ds", [HEAP_TOPIC], 2, None)
+    assert res.success, res.error
+    assert res.data["added"] == {HEAP_TOPIC: 1}
+    assert res.data["failed"] == {}
+    gen_calls = [c for c in router.calls if c["task_type"] == "exam_prep_questions"]
+    assert len(gen_calls) == 2
+    assert all(c["max_tokens"] >= 16384 for c in gen_calls)
+
+
+async def test_generate_reports_bad_output_instead_of_nothing_added(isolated_artifacts):
+    skill, router = await _uploaded_skill([_raise(json.JSONDecodeError("Expecting value", "", 0))])
+    res = await skill.generate("ds", [HEAP_TOPIC], 2, None)
+    assert not res.success
+    assert res.error == "generate_llm_bad_output"
+    assert len([c for c in router.calls if c["task_type"] == "exam_prep_questions"]) == 2
+
+
+async def test_generate_quota_error_is_not_retried(isolated_artifacts):
+    skill, router = await _uploaded_skill([_raise(_QuotaError("quota"))])
+    res = await skill.generate("ds", [HEAP_TOPIC], 2, None)
+    assert res.error == "generate_llm_rate_limited"
+    assert len([c for c in router.calls if c["task_type"] == "exam_prep_questions"]) == 1
+
+
+async def test_generate_with_only_duplicates_still_succeeds(isolated_artifacts):
+    skill, _ = await _uploaded_skill([lambda p: {"questions": [{"prompt": HEAPIFY_Q, "type": "short_answer"}]}])
+    res = await skill.generate("ds", [HEAP_TOPIC], 2, None)
+    assert res.success
+    assert res.data["added"] == {HEAP_TOPIC: 0} and res.data["failed"] == {}
+
+
+def test_parse_json_repairs_common_model_slips():
+    from nano_notebooklm.ai.openai_backend import _parse_json
+    bs = "\\"
+    assert _parse_json('Sure:\n{"a": 1}\nDone.') == {"a": 1}
+    assert _parse_json('{"a": "line1\nline2"}') == {"a": "line1\nline2"}
+    assert _parse_json('{"a": "O(n ' + bs + 'log n)"}') == {"a": "O(n " + bs + "log n)"}
+    with pytest.raises(json.JSONDecodeError):
+        _parse_json('```json\n{"questions": [{"prompt": "cut off')
 
 
 async def test_variant_of_past_exam_question_reuses_exemplars(isolated_artifacts):

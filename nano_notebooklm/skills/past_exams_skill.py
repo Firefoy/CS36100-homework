@@ -65,6 +65,25 @@ def _index_lock(course_id: str) -> asyncio.Lock:
     return ep._lock_for(f"past_exams::{course_id}")
 
 
+class LLMStepFailed(Exception):
+    """Every LLM call of a step failed, so an empty result says nothing
+    about the exam. Carries an error token for the UI."""
+
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+llm_error_code = ep.llm_error_code
+
+
+def _worst(codes: list[str]) -> str:
+    for code in ("llm_rate_limited", "llm_failed", "llm_bad_output"):
+        if code in codes:
+            return code
+    return "llm_failed"
+
+
 # ── persistence ───────────────────────────────────────────────────────
 
 
@@ -334,20 +353,27 @@ class PastExamsSkill(Skill):
                 return SkillResult(success=False, error="no_questions_found")
 
             await self._update_entry(course_id, exam_id, stage="tagging")
-            topics = await self._ensure_topics(course_id, user_lang)
-            if topics:
-                await self._tag(questions, topics)
+            topics, topics_error = await self._ensure_topics(course_id, user_lang)
+            tag_errors = await self._tag(questions, topics) if topics else []
 
             async with _index_lock(course_id):
                 if not exam_dir(course_id, exam_id).exists():
                     return SkillResult(success=False, error="exam_not_found")
                 _save_questions(course_id, exam_id, questions)
+            # Questions are kept even when tagging failed: the UI offers a
+            # re-tag, which costs far fewer calls than re-uploading.
+            if tag_errors:
+                warning = "tagging_" + _worst(tag_errors)
+            else:
+                warning = topics_error
             await self._update_entry(
                 course_id, exam_id, status="ready", stage="done",
-                question_count=len(questions),
-                error=None if topics else "no_course_topics",
+                question_count=len(questions), error=warning,
             )
             return SkillResult(success=True, data={"exam_id": exam_id, "question_count": len(questions)})
+        except LLMStepFailed as exc:
+            await self._update_entry(course_id, exam_id, status="failed", error=exc.code)
+            return SkillResult(success=False, error=exc.code)
         except Exception as exc:
             logger.warning("past_exams process failed for %s/%s: %s", course_id, exam_id, type(exc).__name__)
             await self._update_entry(course_id, exam_id, status="failed", error="processing_failed")
@@ -362,25 +388,33 @@ class PastExamsSkill(Skill):
 
     # ── LLM steps ──────────────────────────────────────────────────
 
-    async def _llm(self, prompt: str, task_type: str, temperature: float) -> Any:
+    async def _llm(self, prompt: str, task_type: str, temperature: float, max_tokens: int = 4096) -> Any:
         async with ep._get_variant_semaphore():
             return await asyncio.wait_for(
                 self.router.complete_structured(
                     prompt, task_type=task_type,
                     system=prompts.PAST_EXAM_SYSTEM, temperature=temperature,
+                    max_tokens=max_tokens,
                 ),
                 timeout=ep.EXAM_PREP_LLM_TIMEOUT_S,
             )
 
     async def _segment(self, filename: str, page_texts: list[tuple[int, str]]) -> list[dict]:
+        """Raises LLMStepFailed when every window's call failed."""
         questions: list[dict] = []
         seen: set[str] = set()
-        for window in _windows(page_texts):
+        errors: list[str] = []
+        windows = _windows(page_texts)
+        for window in windows:
             prompt = prompts.PAST_EXAM_SEGMENT_PROMPT.format(filename=filename, exam_text=window)
             try:
-                data = await self._llm(prompt, "past_exam_segment", 0.0)
+                # The reply restates every question in full, and reasoning
+                # models spend part of the budget on hidden thinking tokens,
+                # so the 4096 default risks truncated (unparseable) JSON.
+                data = await self._llm(prompt, "past_exam_segment", 0.0, max_tokens=16384)
             except Exception as exc:
                 logger.warning("past_exams segment call failed: %s", type(exc).__name__)
+                errors.append(llm_error_code(exc))
                 continue
             raw = data.get("questions") if isinstance(data, dict) else data
             if not isinstance(raw, list):
@@ -410,18 +444,24 @@ class PastExamsSkill(Skill):
                 })
                 if len(questions) >= MAX_QUESTIONS_PER_EXAM:
                     return questions
+        if windows and len(errors) == len(windows):
+            raise LLMStepFailed(_worst(errors))
         return questions
 
-    async def _ensure_topics(self, course_id: str, user_lang: str | None) -> list[dict]:
-        """Exam Prep topics to tag against; planned from course material if
-        the bank has none yet. Empty when the course has no content."""
+    async def _ensure_topics(self, course_id: str, user_lang: str | None) -> tuple[list[dict], str | None]:
+        """Exam Prep topics to tag against, planned from course material if
+        the bank has none yet. Returns (topics, error_token_if_empty)."""
         topics = _bank_topics(course_id)
         if not topics:
             res = await ep.ExamPrepSkill(self.kb, self.router).plan_topics(course_id, {}, user_lang)
             if not res.success:
                 logger.info("past_exams: topic planning unavailable for %s: %s", course_id, res.error)
-                return []
+                if res.error == "no_course_content":
+                    return [], "no_course_topics"
+                return [], "topic_planning_failed"
             topics = _bank_topics(course_id)
+            if not topics:
+                return [], "no_course_topics"
         out = []
         for t in topics:
             hint = ""
@@ -431,30 +471,31 @@ class PastExamsSkill(Skill):
                     hint = " ".join(chunk.text.split())[:240]
                     break
             out.append({"id": t["id"], "name": t["name"], "hint": hint})
-        return out
+        return out, None
 
-    async def _tag(self, questions: list[dict], topics: list[dict]) -> None:
+    async def _tag(self, questions: list[dict], topics: list[dict]) -> list[str]:
         """Set topic_ids / match / confidence / focus on each question in
-        place. Questions the LLM skips or a failed batch stay `untagged`."""
+        place. Questions the LLM skips or a failed batch stay `untagged`.
+        Returns an error token per failed batch."""
         valid = {t["id"] for t in topics}
         topics_block = "\n".join(
             f"- {t['id']}: {t['name']}" + (f" (course excerpt: {t['hint']})" if t["hint"] else "")
             for t in topics
         )
 
-        async def _batch(batch: list[dict]) -> None:
+        async def _batch(batch: list[dict]) -> str | None:
             questions_block = "\n\n".join(f"[{q['id']}] {q['text'][:700]}" for q in batch)
             prompt = prompts.PAST_EXAM_TAG_PROMPT.format(
                 topics_block=topics_block, questions_block=questions_block,
             )
             try:
-                data = await self._llm(prompt, "past_exam_tag", 0.0)
+                data = await self._llm(prompt, "past_exam_tag", 0.0, max_tokens=8192)
             except Exception as exc:
                 logger.warning("past_exams tag call failed: %s", type(exc).__name__)
-                return
+                return llm_error_code(exc)
             tags = data.get("tags") if isinstance(data, dict) else data
             if not isinstance(tags, list):
-                return
+                return "llm_failed"
             by_id = {q["id"]: q for q in batch}
             for tag in tags:
                 if not isinstance(tag, dict):
@@ -477,9 +518,11 @@ class PastExamsSkill(Skill):
                     "confidence": conf,
                     "focus": str(focus)[:600] if focus else None,
                 })
+            return None
 
         batches = [questions[i:i + TAG_BATCH_SIZE] for i in range(0, len(questions), TAG_BATCH_SIZE)]
-        await asyncio.gather(*(_batch(b) for b in batches))
+        results = await asyncio.gather(*(_batch(b) for b in batches))
+        return [r for r in results if r]
 
     # ── read / edit ────────────────────────────────────────────────
 
@@ -494,6 +537,8 @@ class PastExamsSkill(Skill):
         exams_out = []
         for exam in index["exams"]:
             qs_out = []
+            if exam.get("status") == "ready" and str(exam.get("error") or "").startswith(("tagging_", "topic_planning_")):
+                needs_retag = True
             if exam.get("status") == "ready":
                 for raw in load_questions(course_id, exam["exam_id"]):
                     q = _effective(raw, overrides, valid)
@@ -547,18 +592,30 @@ class PastExamsSkill(Skill):
     async def retag(self, course_id: str, user_lang: str | None) -> SkillResult:
         """Re-run tagging for every ready exam against the current topics.
         Student overrides live in overrides.json and keep winning."""
-        topics = await self._ensure_topics(course_id, user_lang)
+        topics, topics_error = await self._ensure_topics(course_id, user_lang)
         if not topics:
-            return SkillResult(success=False, error="no_course_topics")
+            return SkillResult(success=False, error=topics_error or "no_course_topics")
+        errors: list[str] = []
         async with _index_lock(course_id):
-            for exam in _ready_exams(course_id):
+            index = load_index(course_id)
+            for exam in index["exams"]:
+                if exam.get("status") != "ready":
+                    continue
                 qs = load_questions(course_id, exam["exam_id"])
                 if not qs:
                     continue
-                for q in qs:
-                    q.update({"topic_ids": [], "match": "untagged", "confidence": 0.0, "focus": None})
-                await self._tag(qs, topics)
-                _save_questions(course_id, exam["exam_id"], qs)
+                # Re-tag into a copy so a failed batch can't wipe tags that
+                # were already good.
+                fresh = [{**q, "topic_ids": [], "match": "untagged", "confidence": 0.0, "focus": None} for q in qs]
+                exam_errors = await self._tag(fresh, topics)
+                if exam_errors:
+                    errors.extend(exam_errors)
+                    fresh = [f if f["match"] != "untagged" else q for f, q in zip(fresh, qs)]
+                _save_questions(course_id, exam["exam_id"], fresh)
+                exam["error"] = ("tagging_" + _worst(exam_errors)) if exam_errors else None
+            _save_index(course_id, index)
+        if errors:
+            return SkillResult(success=False, error=_worst(errors))
         return SkillResult(success=True, data=self.view(course_id))
 
     async def delete(self, course_id: str, exam_id: str) -> SkillResult:
@@ -595,22 +652,33 @@ class PastExamsSkill(Skill):
         async with ep._lock_for(course_id):
             bank = ep.load_bank(course_id)
             topic_by_id = {t["id"]: t for t in bank.get("topics", []) if not t.get("archived_topic")}
-            jobs, job_ids = [], []
+            jobs, job_ids, job_errors = [], [], []
             for tid, ex in targets.items():
                 topic = topic_by_id.get(tid)
                 if topic is None:
                     skipped[tid] = "unknown_topic"
                     continue
+                errs: list[str] = []
                 jobs.append(prep._generate_questions(
                     course_id, topic, count=count, kinds=GENERATE_KINDS,
-                    variant_of=None, user_lang=user_lang, exemplars=ex,
+                    variant_of=None, user_lang=user_lang, exemplars=ex, errors=errs,
                 ))
                 job_ids.append(tid)
+                job_errors.append(errs)
             results = await asyncio.gather(*jobs, return_exceptions=True)
             added = {tid: (r if isinstance(r, int) else 0) for tid, r in zip(job_ids, results)}
+            failed = {}
+            for tid, r, errs in zip(job_ids, results, job_errors):
+                if isinstance(r, BaseException):
+                    errs.append(llm_error_code(r))
+                if errs and not added[tid]:
+                    failed[tid] = _worst(errs)
             ep.save_bank(course_id, bank)
+        if failed and not any(added.values()):
+            return SkillResult(success=False, error="generate_" + _worst(list(failed.values())))
         return SkillResult(success=True, data={
             "added": added,
             "skipped": skipped,
+            "failed": failed,
             "view": prep._compute_view(bank),
         })

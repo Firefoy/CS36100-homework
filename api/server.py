@@ -1709,6 +1709,8 @@ def _past_exam_status_for_error(error: str | None) -> int:
         return 404
     if error in ("exam_processing", "bank_version_too_new"):
         return 409
+    if error in ("llm_rate_limited", "generate_llm_rate_limited"):
+        return 429
     if error in ("invalid_topic", "invalid_match", "no_exemplars", "no_course_topics"):
         return 400
     return 502

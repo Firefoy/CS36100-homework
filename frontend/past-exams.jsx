@@ -133,7 +133,10 @@ function PastExams({ activeCourse, userLang }) {
       const res = await API.pastExamsGenerate(courseId, selectedIds, { count, userLang });
       const added = Object.values(res.added || {}).reduce((s, n) => s + n, 0);
       if (courseRef.current !== courseId) return;
-      setInfo(added > 0 ? t("pastexam.info.generated", { n: added }) : t("pastexam.info.generated_none"));
+      const failedTopics = Object.keys(res.failed || {}).length;
+      setInfo(added === 0 ? t("pastexam.info.generated_none")
+        : failedTopics ? t("pastexam.info.generated_partial", { n: added, m: failedTopics })
+        : t("pastexam.info.generated", { n: added }));
       await load(courseId);
     }, "pastexam.error.failed_generate");
   }
@@ -347,8 +350,8 @@ function PastExamCard({ t, exam, topics, expanded, onToggle, onDelete, onTagChan
       {exam.status === "failed" && (
         <div className="pe-exam-error">{t("pastexam.error." + (exam.error || "processing_failed"))}</div>
       )}
-      {exam.status === "ready" && exam.error === "no_course_topics" && (
-        <div className="pe-exam-error">{t("pastexam.error.no_course_topics")}</div>
+      {exam.status === "ready" && exam.error && (
+        <div className="pe-exam-error">{t("pastexam.error." + exam.error)}</div>
       )}
       {expanded && exam.status === "ready" && (
         <div className="pe-question-list">

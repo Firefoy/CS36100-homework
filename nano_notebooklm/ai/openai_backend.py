@@ -376,11 +376,33 @@ class OpenAIBackend(LLMBackend):
         return _parse_json(resp.content)
 
 
+_INVALID_JSON_ESCAPE = re.compile(r'\\(?!["\\/bfnrtu])')
+
+
 def _parse_json(text: str) -> dict:
-    """Parse JSON from LLM response, handling markdown code blocks."""
+    """Parse JSON from LLM response, handling markdown code blocks.
+
+    Falls back to lenient repairs only after a strict parse fails: models
+    wrap the object in prose, emit raw newlines inside strings, and write
+    LaTeX such as `O(n \\log n)` whose backslash is not a valid JSON escape.
+    """
     text = text.strip()
     if "```" in text:
         m = re.search(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL)
         if m:
             text = m.group(1).strip()
-    return json.loads(text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as first_err:
+        starts = [i for i in (text.find("{"), text.find("[")) if i >= 0]
+        if starts:
+            start = min(starts)
+            end = text.rfind("}" if text[start] == "{" else "]")
+            if end > start:
+                text = text[start:end + 1]
+        for candidate in (text, _INVALID_JSON_ESCAPE.sub(r"\\\\", text)):
+            try:
+                return json.loads(candidate, strict=False)
+            except json.JSONDecodeError:
+                continue
+        raise first_err

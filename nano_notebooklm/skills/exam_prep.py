@@ -70,6 +70,18 @@ DEFAULT_SEEDS_PER_TYPE = 2
 QUIZ_DEFAULT_SIZE = 8
 # Env-tunable so operators on slow providers can raise the ceiling.
 EXAM_PREP_LLM_TIMEOUT_S = float(os.getenv("EXAM_PREP_LLM_TIMEOUT_SECONDS", "120.0"))
+# Thinking models (Gemini 2.5, o-series) spend part of max_tokens on hidden
+# reasoning, so the 4096 router default can cut the JSON off mid-question.
+GEN_MAX_TOKENS = 16384
+GEN_PARSE_RETRIES = 1
+
+
+def llm_error_code(exc: BaseException) -> str:
+    """Provider-agnostic: OpenAI and Anthropic SDK errors both expose
+    `status_code`; free-tier quota exhaustion surfaces as HTTP 429."""
+    if getattr(exc, "status_code", None) == 429 or "ratelimit" in type(exc).__name__.lower():
+        return "llm_rate_limited"
+    return "llm_failed"
 # fix-all v1 H3: cap concurrent variant-generation LLM calls. Notes pipeline
 # uses _FULL_COURSE_SEMAPHORE=2 for the analogous burst; here we sit at 4 to
 # match the shared ThreadPoolExecutor(max_workers=4) so we don't oversubscribe
@@ -716,8 +728,13 @@ class ExamPrepSkill(Skill):
         variant_of: str | None,
         user_lang: str | None = None,
         exemplars: list[dict] | None = None,
+        errors: list[str] | None = None,
     ) -> int:
         """Append questions to `topic`. Returns total added.
+
+        A failed LLM call returns 0; when `errors` is given, the failure's
+        token (llm_rate_limited / llm_failed / llm_bad_output) is appended
+        so callers can tell it apart from "the model wrote only duplicates".
 
         Without `exemplars`: `count` questions per kind, from course material.
         With `exemplars` (past-exam questions, see past_exams_skill): `count`
@@ -785,30 +802,42 @@ class ExamPrepSkill(Skill):
         # H3: gate concurrent variant generation through a module-level
         # semaphore so a 20-wrong-topic submit can't fan out 20× codex calls
         # in parallel.
-        try:
-            async with _get_variant_semaphore():
-                data = await asyncio.wait_for(
-                    self.router.complete_structured(
-                        prompt,
-                        task_type="exam_prep_questions",
-                        system=system,
-                        temperature=0.6,
-                    ),
-                    timeout=EXAM_PREP_LLM_TIMEOUT_S,
+        data = None
+        for attempt in range(1 + GEN_PARSE_RETRIES):
+            try:
+                async with _get_variant_semaphore():
+                    data = await asyncio.wait_for(
+                        self.router.complete_structured(
+                            prompt,
+                            task_type="exam_prep_questions",
+                            system=system,
+                            temperature=0.6,
+                            max_tokens=GEN_MAX_TOKENS,
+                        ),
+                        timeout=EXAM_PREP_LLM_TIMEOUT_S,
+                    )
+                break
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "exam_prep question gen timed out after %ss for topic %s",
+                    EXAM_PREP_LLM_TIMEOUT_S, topic.get("id"),
                 )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "exam_prep question gen timed out after %ss for topic %s",
-                EXAM_PREP_LLM_TIMEOUT_S, topic.get("id"),
-            )
-            return 0
-        except Exception as exc:
-            # M1: log exception type only, never body.
-            logger.warning(
-                "exam_prep question gen failed for topic %s: %s",
-                topic.get("id"), type(exc).__name__,
-            )
-            return 0
+                if errors is not None:
+                    errors.append("llm_failed")
+                return 0
+            except Exception as exc:
+                # M1: log exception type only, never body.
+                logger.warning(
+                    "exam_prep question gen failed for topic %s (attempt %d): %s",
+                    topic.get("id"), attempt + 1, type(exc).__name__,
+                )
+                # Sampling at temperature 0.6 makes malformed JSON a per-call
+                # accident, so one retry usually recovers; API errors won't.
+                if isinstance(exc, ValueError) and attempt < GEN_PARSE_RETRIES:
+                    continue
+                if errors is not None:
+                    errors.append("llm_bad_output" if isinstance(exc, ValueError) else llm_error_code(exc))
+                return 0
 
         raw_qs = data.get("questions") if isinstance(data, dict) else data
         if not isinstance(raw_qs, list):
